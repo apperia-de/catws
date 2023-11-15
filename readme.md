@@ -15,10 +15,10 @@ In order to subscribe to channels and consume data from the _Coinbase Advanced T
 
 1. Login to your Coinbase account at https://www.coinbase.com
 2. Go to **settings** page and select the **API** tab (https://www.coinbase.com/settings/api)
-3. Create a new API key for **all** crypto pairs and with permission set to at least `wallet:user:read`
+3. Create a new API key for **all** crypto pairs and with permission set to at least `wallet:user:read`.
 <img src="https://github.com/sknr/catws/blob/main/api-key-permissions.png" width="50%">
 
-## Usage
+## Example usage
 
 ```go
 package main
@@ -37,9 +37,9 @@ func main() {
 
 	ws := catws.New(
 		catws.WithCredentials("YOUR_COINBASE_API_KEY", "YOUR_COINBASE_API_SECRET"),
-		catws.WithLogging(), // Enable logging
+		catws.WithLogging(), // Enable logging.
 	)
-	// Subscribe to user channel for all product ids
+	// Subscribe to user channel for all product ids.
 	ws.Subscribe(catws.UserChannel, nil)
 	ws.Subscribe(catws.TickerBatchChannel, []string{"BTC-EUR", "ETH-EUR", "XRP-EUR"})
 	quitChan := make(chan struct{})
@@ -57,6 +57,10 @@ func main() {
 				fmt.Println(m)
 			case m := <-ws.Channel.Status:
 				fmt.Println(m)
+			case m := <-ws.Channel.MarketTrades:
+				fmt.Println(m)
+			case m := <-ws.Channel.Level2:
+				fmt.Println(m)
 			case <-quitChan:
 				fmt.Println("shutdown go-routine...")
 				quitChan <- struct{}{}
@@ -65,16 +69,15 @@ func main() {
 		}
 	}()
 
-	// Block until a signal is received.
+	// Block until a signal is received. (CTRL-C)
 	<-c
-	// Correctly unsubscribe from user channel since only one connection per user is allowed
+	// Correctly unsubscribe from user channel, since only one connection per user is allowed.
 	ws.Unsubscribe(catws.UserChannel, nil)
 	time.Sleep(time.Second)
 	quitChan <- struct{}{}
-	// Wait for the go routine to quit
+	// Wait for the go routine to quit.
 	<-quitChan
 	fmt.Println("closing websocket...")
 	ws.CloseNormal()
 }
-
 ```
