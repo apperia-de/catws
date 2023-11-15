@@ -95,8 +95,6 @@ func New(opts ...Option) *AdvancedTradeWS {
 }
 
 func (ws *AdvancedTradeWS) CloseNormal() {
-	ws.Unsubscribe(UserChannel, nil)
-	time.Sleep(time.Second)
 	if err := ws.conn.Close(websocket.StatusNormalClosure, ""); err != nil {
 		ws.logger.Fatal(err)
 	}
