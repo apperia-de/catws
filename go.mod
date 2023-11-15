@@ -1,4 +1,4 @@
-module github.com/sknr/coinbase-websocket
+module github.com/sknr/catws
 
 go 1.21
 

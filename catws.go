@@ -23,29 +23,38 @@ const (
 	AdvanceTradeWebsocketURL = "wss://advanced-trade-ws.coinbase.com"
 
 	HeartbeatChannel     = "heartbeats"
-	UserChannel          = "user"
-	StatusChannel        = "status"
-	SubscriptionsChannel = "subscriptions"
-	TickerChannel        = "ticker"
-	TickerBatchChannel   = "ticker_batch"
 	Level2Channel        = "level2"
 	MarketTradesChannel  = "market_trades"
+	StatusChannel        = "status"
+	SubscriptionsChannel = "subscriptions"
+	TickerBatchChannel   = "ticker_batch"
+	TickerChannel        = "ticker"
+	UserChannel          = "user"
 
 	ContextTimeout = time.Second * 10
 )
 
 type Option func(*AdvancedTradeWS)
 
+// WithCredentials option provides the required apiKey and apiSecret of the coinbase user
 func WithCredentials(apiKey, apiSecret string) Option {
-	return func(atws *AdvancedTradeWS) {
-		atws.credentials.apiKey = apiKey
-		atws.credentials.apiSecret = apiSecret
+	return func(ws *AdvancedTradeWS) {
+		ws.credentials.apiKey = apiKey
+		ws.credentials.apiSecret = apiSecret
 	}
 }
 
+// WithURL allows changing the default coinbase websocket url
+func WithURL(url string) Option {
+	return func(ws *AdvancedTradeWS) {
+		ws.wsURL = url
+	}
+}
+
+// WithLogging option enables package logging to stdErr (Default: logging to io.Discard)
 func WithLogging() Option {
-	return func(atws *AdvancedTradeWS) {
-		atws.logger = log.New(os.Stderr, "", log.Lmicroseconds)
+	return func(ws *AdvancedTradeWS) {
+		ws.logger = log.New(os.Stderr, "", log.Lmicroseconds)
 	}
 }
 
@@ -54,6 +63,7 @@ type AdvancedTradeWS struct {
 	wg          sync.WaitGroup
 	logger      *log.Logger
 	opts        []Option // Store options for reconnect
+	wsURL       string
 	credentials struct {
 		apiKey    string
 		apiSecret string
@@ -70,29 +80,30 @@ type AdvancedTradeWS struct {
 }
 
 func New(opts ...Option) *AdvancedTradeWS {
-	atws := &AdvancedTradeWS{
+	ws := &AdvancedTradeWS{
 		logger: log.New(io.Discard, "", log.LstdFlags),
 		opts:   opts,
+		wsURL:  AdvanceTradeWebsocketURL,
 	}
 
 	// Loop through each option
 	for _, opt := range opts {
-		opt(atws)
+		opt(ws)
 	}
 
-	return connect(atws)
+	return connect(ws)
 }
 
-func (atws *AdvancedTradeWS) CloseNormal() {
-	atws.Unsubscribe(UserChannel, nil)
+func (ws *AdvancedTradeWS) CloseNormal() {
+	ws.Unsubscribe(UserChannel, nil)
 	time.Sleep(time.Second)
-	if err := atws.conn.Close(websocket.StatusNormalClosure, ""); err != nil {
-		atws.logger.Fatal(err)
+	if err := ws.conn.Close(websocket.StatusNormalClosure, ""); err != nil {
+		ws.logger.Fatal(err)
 	}
-	atws.wg.Wait()
+	ws.wg.Wait()
 }
 
-func (atws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
+func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
 	defer cancel()
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
@@ -101,25 +112,25 @@ func (atws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
 		Type:       "subscribe",
 		ProductIds: productIDs,
 		Channel:    channel,
-		APIKey:     atws.credentials.apiKey,
+		APIKey:     ws.credentials.apiKey,
 		Timestamp:  timestamp,
-		Signature:  atws.signature(timestamp, channel, productIDs),
+		Signature:  ws.signature(timestamp, channel, productIDs),
 	}
 
 	if len(productIDs) > 0 {
-		atws.logger.Printf("Subscribe to %q channel for product ids: [%s]", channel, strings.Join(productIDs, ","))
+		ws.logger.Printf("Subscribe to %q channel for product ids: [%s]", channel, strings.Join(productIDs, ","))
 	} else {
-		atws.logger.Printf("Subscribe to %q channel", channel)
+		ws.logger.Printf("Subscribe to %q channel", channel)
 	}
 
-	err := wsjson.Write(ctx, atws.conn, msg)
+	err := wsjson.Write(ctx, ws.conn, msg)
 	if err != nil {
 		// ...
 		panic(err)
 	}
 }
 
-func (atws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
+func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
 	defer cancel()
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
@@ -128,24 +139,24 @@ func (atws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 		Type:       "unsubscribe",
 		ProductIds: productIDs,
 		Channel:    channel,
-		APIKey:     atws.credentials.apiKey,
+		APIKey:     ws.credentials.apiKey,
 		Timestamp:  timestamp,
-		Signature:  atws.signature(timestamp, channel, productIDs),
+		Signature:  ws.signature(timestamp, channel, productIDs),
 	}
 
-	atws.logger.Printf("Unsubscribe from %q channel", channel)
+	ws.logger.Printf("Unsubscribe from %q channel", channel)
 
-	err := wsjson.Write(ctx, atws.conn, msg)
+	err := wsjson.Write(ctx, ws.conn, msg)
 	if err != nil {
 		// ...
 		panic(err)
 	}
 }
 
-func connect(atws *AdvancedTradeWS) *AdvancedTradeWS {
-	err := backoff2.RetryNotify(atws.connect, backoff2.NewExponentialBackOff(), func(err error, t time.Duration) {
-		atws.logger.Println(err)
-		atws.logger.Println("Next reconnection try at %s", time.Now().Add(t))
+func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
+	err := backoff2.RetryNotify(ws.connect, backoff2.NewExponentialBackOff(), func(err error, t time.Duration) {
+		ws.logger.Println(err)
+		ws.logger.Println("Next reconnection try at %s", time.Now().Add(t))
 	})
 
 	if err != nil {
@@ -154,101 +165,101 @@ func connect(atws *AdvancedTradeWS) *AdvancedTradeWS {
 	}
 
 	// We always subscribe to the heartbeat channel, in order to keep the connection open
-	atws.Subscribe(HeartbeatChannel, nil)
+	ws.Subscribe(HeartbeatChannel, nil)
 
-	go atws.readMessages()
+	go ws.readMessages()
 
-	return atws
+	return ws
 }
 
-func (atws *AdvancedTradeWS) signature(timestamp, channel string, productIDs []string) string {
+func (ws *AdvancedTradeWS) signature(timestamp, channel string, productIDs []string) string {
 	payload := fmt.Sprintf("%s%s%s", timestamp, channel, strings.Join(productIDs, ","))
 
-	sig := hmac.New(sha256.New, []byte(atws.credentials.apiSecret))
+	sig := hmac.New(sha256.New, []byte(ws.credentials.apiSecret))
 	sig.Write([]byte(payload))
 	sum := hex.EncodeToString(sig.Sum(nil))
 
 	return sum
 }
 
-func (atws *AdvancedTradeWS) connect() error {
+func (ws *AdvancedTradeWS) connect() error {
 	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
 	defer cancel()
 
-	//c, _, err := websocket.Dial(ctx, AdvanceTradeWebsocketURL, &websocket.DialOptions{HTTPClient: &http.Client{Timeout: 30}})
-	c, _, err := websocket.Dial(ctx, AdvanceTradeWebsocketURL, nil)
+	c, _, err := websocket.Dial(ctx, ws.wsURL, nil)
 	if err != nil {
 		return err
 	}
+
 	// In order to disable read limit set it to -1
 	c.SetReadLimit(1 << 20) // Equals 2^20 = 1048576 bytes = 1MB
 
-	atws.conn = c
+	ws.conn = c
 
 	return nil
 }
 
-func (atws *AdvancedTradeWS) reconnect() {
-	_ = atws.conn.CloseNow()
-	atws.wg.Wait()
-	atws.logger.Printf("Reconnecting...")
-	atws = New(atws.opts...)
+func (ws *AdvancedTradeWS) reconnect() {
+	_ = ws.conn.CloseNow()
+	ws.wg.Wait()
+	ws.logger.Printf("Reconnecting...")
+	ws = New(ws.opts...)
 }
 
 // readMessages reads message from the subscribed websocket channels and sends it to the corresponding messageChan
-func (atws *AdvancedTradeWS) readMessages() {
+func (ws *AdvancedTradeWS) readMessages() {
 	var res interface{}
 
-	atws.wg.Add(1)
-	defer atws.wg.Done()
+	ws.wg.Add(1)
+	defer ws.wg.Done()
 
 	heartbeatChan := make(chan HeartbeatMessage, 1)
-	atws.Channel.Heartbeat = func(ch chan HeartbeatMessage) <-chan HeartbeatMessage {
+	ws.Channel.Heartbeat = func(ch chan HeartbeatMessage) <-chan HeartbeatMessage {
 		return ch
 	}(heartbeatChan)
 
 	statusChan := make(chan StatusMessage, 5)
-	atws.Channel.Status = func(ch chan StatusMessage) <-chan StatusMessage {
+	ws.Channel.Status = func(ch chan StatusMessage) <-chan StatusMessage {
 		return ch
 	}(statusChan)
 
 	userChan := make(chan UserMessage, 5)
-	atws.Channel.User = func(ch chan UserMessage) <-chan UserMessage {
+	ws.Channel.User = func(ch chan UserMessage) <-chan UserMessage {
 		return ch
 	}(userChan)
 
 	tickerChan := make(chan TickerMessage, 50)
-	atws.Channel.Ticker = func(ch chan TickerMessage) <-chan TickerMessage {
+	ws.Channel.Ticker = func(ch chan TickerMessage) <-chan TickerMessage {
 		return ch
 	}(tickerChan)
 
 	level2Chan := make(chan Level2Message, 100)
-	atws.Channel.Level2 = func(ch chan Level2Message) <-chan Level2Message {
+	ws.Channel.Level2 = func(ch chan Level2Message) <-chan Level2Message {
 		return ch
 	}(level2Chan)
 
 	marketTradesChan := make(chan MarketTradesMessage, 50)
-	atws.Channel.MarketTrades = func(ch chan MarketTradesMessage) <-chan MarketTradesMessage {
+	ws.Channel.MarketTrades = func(ch chan MarketTradesMessage) <-chan MarketTradesMessage {
 		return ch
 	}(marketTradesChan)
 
 	subscriptionChan := make(chan SubscriptionsMessage, 10)
-	atws.Channel.Subscription = func(ch chan SubscriptionsMessage) <-chan SubscriptionsMessage {
+	ws.Channel.Subscription = func(ch chan SubscriptionsMessage) <-chan SubscriptionsMessage {
 		return ch
 	}(subscriptionChan)
 
 	for {
-		if err := wsjson.Read(context.Background(), atws.conn, &res); err != nil {
+		if err := wsjson.Read(context.Background(), ws.conn, &res); err != nil {
 			switch websocket.CloseStatus(err) {
 			case websocket.StatusNormalClosure:
-				atws.logger.Println("Received normal close message")
+				ws.logger.Println("Received normal close message")
 			case websocket.StatusAbnormalClosure:
-				atws.logger.Println("Abnormal closure -> Restart websocket")
-				go atws.reconnect()
+				ws.logger.Println("Abnormal closure -> Restart websocket")
+				go ws.reconnect()
 			case -1:
 				// Not a CloseError
-				atws.logger.Printf("Not a CloseError: %s\n", err)
-				go atws.reconnect()
+				ws.logger.Printf("Not a CloseError: %s\n", err)
+				go ws.reconnect()
 			}
 
 			return
@@ -309,7 +320,7 @@ func (atws *AdvancedTradeWS) readMessages() {
 			}
 			marketTradesChan <- m
 		default:
-			atws.logger.Println("Unknown message:", string(data))
+			ws.logger.Println("Unknown message:", string(data))
 		}
 	}
 }
