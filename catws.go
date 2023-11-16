@@ -153,8 +153,8 @@ func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 
 func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
 	err := backoff2.RetryNotify(ws.connect, backoff2.NewExponentialBackOff(), func(err error, t time.Duration) {
-		ws.logger.Println(err)
-		ws.logger.Println("Next reconnection try at %s", time.Now().Add(t))
+		ws.logger.Print(err)
+		ws.logger.Printf("Next reconnection try at %s", time.Now().Add(t))
 	})
 
 	if err != nil {
@@ -201,7 +201,7 @@ func (ws *AdvancedTradeWS) reconnect() {
 	_ = ws.conn.CloseNow()
 	ws.wg.Wait()
 	ws.logger.Printf("Reconnecting...")
-	ws = New(ws.opts...)
+	*ws = *New(ws.opts...)
 }
 
 // readMessages reads message from the subscribed websocket channels and sends it to the corresponding messageChan
@@ -250,9 +250,9 @@ func (ws *AdvancedTradeWS) readMessages() {
 		if err := wsjson.Read(context.Background(), ws.conn, &res); err != nil {
 			switch websocket.CloseStatus(err) {
 			case websocket.StatusNormalClosure:
-				ws.logger.Println("Received normal close message")
+				ws.logger.Print("Received normal close message")
 			case websocket.StatusAbnormalClosure:
-				ws.logger.Println("Abnormal closure -> Restart websocket")
+				ws.logger.Print("Abnormal closure -> Restart websocket")
 				go ws.reconnect()
 			case -1:
 				// Not a CloseError
@@ -318,7 +318,7 @@ func (ws *AdvancedTradeWS) readMessages() {
 			}
 			marketTradesChan <- m
 		default:
-			ws.logger.Println("Unknown message:", string(data))
+			ws.logger.Print("Unknown message:", string(data))
 		}
 	}
 }
