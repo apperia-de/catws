@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	backoff2 "github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v4"
 	"io"
 	"log"
 	"nhooyr.io/websocket"
@@ -152,7 +152,7 @@ func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 }
 
 func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
-	err := backoff2.RetryNotify(ws.connect, backoff2.NewExponentialBackOff(), func(err error, t time.Duration) {
+	err := backoff.RetryNotify(ws.connect, backoff.NewExponentialBackOff(), func(err error, t time.Duration) {
 		ws.logger.Print(err)
 		ws.logger.Printf("Next reconnection try at %s", time.Now().Add(t))
 	})
