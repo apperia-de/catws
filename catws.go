@@ -271,44 +271,32 @@ func (ws *AdvancedTradeWS) readMessages() {
 		case HeartbeatChannel:
 			var m HeartbeatMessage
 			_ = json.Unmarshal(data, &m)
-			if len(heartbeatChan) == cap(heartbeatChan) {
-				<-heartbeatChan // Discard oldest message
-			}
+			discardOldest(heartbeatChan)
 			heartbeatChan <- m
 		case UserChannel:
 			var m UserMessage
 			_ = json.Unmarshal(data, &m)
-			if len(userChan) == cap(userChan) {
-				<-userChan // Discard oldest message
-			}
+			discardOldest(userChan)
 			userChan <- m
 		case StatusChannel:
 			var m StatusMessage
 			_ = json.Unmarshal(data, &m)
-			if len(statusChan) == cap(statusChan) {
-				<-statusChan // Discard oldest message
-			}
+			discardOldest(statusChan)
 			statusChan <- m
 		case SubscriptionsChannel:
 			var m SubscriptionsMessage
 			_ = json.Unmarshal(data, &m)
-			if len(subscriptionChan) == cap(subscriptionChan) {
-				<-subscriptionChan // Discard oldest message
-			}
+			discardOldest(subscriptionChan)
 			subscriptionChan <- m
 		case TickerChannel, TickerBatchChannel:
 			var m TickerMessage
 			_ = json.Unmarshal(data, &m)
-			if len(tickerChan) == cap(tickerChan) {
-				<-tickerChan // Discard oldest message
-			}
+			discardOldest(tickerChan)
 			tickerChan <- m
 		case Level2Channel:
 			var m Level2Message
 			_ = json.Unmarshal(data, &m)
-			if len(level2Chan) == cap(level2Chan) {
-				<-level2Chan // Discard oldest message
-			}
+			discardOldest(level2Chan)
 			level2Chan <- m
 		case MarketTradesChannel:
 			var m MarketTradesMessage
@@ -316,9 +304,17 @@ func (ws *AdvancedTradeWS) readMessages() {
 			if len(marketTradesChan) == cap(marketTradesChan) {
 				<-marketTradesChan // Discard oldest message
 			}
+			discardOldest(marketTradesChan)
 			marketTradesChan <- m
 		default:
 			ws.logger.Print("Unknown message:", string(data))
 		}
+	}
+}
+
+// discardOldest removes the oldest message from the channel if the capacity of the channel is reached
+func discardOldest[T any](c chan T) {
+	if len(c) == cap(c) {
+		<-c // Discard oldest message
 	}
 }
