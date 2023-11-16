@@ -301,9 +301,6 @@ func (ws *AdvancedTradeWS) readMessages() {
 		case MarketTradesChannel:
 			var m MarketTradesMessage
 			_ = json.Unmarshal(data, &m)
-			if len(marketTradesChan) == cap(marketTradesChan) {
-				<-marketTradesChan // Discard oldest message
-			}
 			discardOldest(marketTradesChan)
 			marketTradesChan <- m
 		default:
