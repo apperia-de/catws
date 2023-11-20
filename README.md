@@ -1,6 +1,6 @@
 # Coinbase Advanced Trade WebSocket (catws)
 
-![Go Report Card](https://goreportcard.com/report/github.com/sknr/catws)
+![[Go Report Card](https://goreportcard.com/report/github.com/sknr/catws)](https://goreportcard.com/badge/github.com/sknr/catws)
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/sknr/catws?style=flat)
 ![GitHub Licence](https://img.shields.io/github/license/sknr/catws)
 
