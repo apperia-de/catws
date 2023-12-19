@@ -17,10 +17,7 @@ and consuming the *Coinbase Advanced Trade WebSocket*.
 
 In order to subscribe to channels and consume data from the _Coinbase Advanced Trade WebSocket_, you need to create an API key first.
 
-1. Login to your Coinbase account at https://www.coinbase.com
-2. Go to **settings** page and select the **API** tab (https://www.coinbase.com/settings/api)
-3. Create a new API key for **all** crypto pairs and with permission set to at least `wallet:user:read`.
-<img src="https://github.com/sknr/catws/blob/main/api-key-permissions.png" width="50%">
+Please visit [Creating Cloud API keys](https://docs.cloud.coinbase.com/advanced-trade-api/docs/auth#creating-cloud-api-keys) for details about creating an API key.
 
 ## Example usage
 
@@ -43,8 +40,9 @@ func main() {
 		catws.WithCredentials("YOUR_COINBASE_API_KEY", "YOUR_COINBASE_API_SECRET"),
 		catws.WithLogging(), // Enable logging.
 	)
-	// Subscribe to user channel for all product ids.
+	// Subscribe to user channel (no product_ids needed)
 	ws.Subscribe(catws.UserChannel, nil)
+	// Subscribe to Ticker batch updates for some product ids
 	ws.Subscribe(catws.TickerBatchChannel, []string{"BTC-EUR", "ETH-EUR", "XRP-EUR"})
 	quitChan := make(chan struct{})
 

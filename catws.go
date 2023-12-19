@@ -2,14 +2,18 @@ package catws
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"github.com/cenkalti/backoff/v4"
+	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/square/go-jose.v2/jwt"
 	"io"
 	"log"
+	"math"
+	"math/big"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 	"os"
@@ -32,7 +36,18 @@ const (
 	UserChannel          = "user"
 
 	ContextTimeout = time.Second * 10
+	JWTServiceName = "public_websocket_api"
 )
+
+type nonceSource struct{}
+
+func (n nonceSource) Nonce() (string, error) {
+	r, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
+	if err != nil {
+		return "", err
+	}
+	return r.String(), nil
+}
 
 type Option func(*AdvancedTradeWS)
 
@@ -110,9 +125,8 @@ func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
 		Type:       "subscribe",
 		ProductIds: productIDs,
 		Channel:    channel,
-		APIKey:     ws.credentials.apiKey,
+		JWT:        ws.buildJWT(),
 		Timestamp:  timestamp,
-		Signature:  ws.signature(timestamp, channel, productIDs),
 	}
 
 	if len(productIDs) > 0 {
@@ -137,9 +151,8 @@ func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 		Type:       "unsubscribe",
 		ProductIds: productIDs,
 		Channel:    channel,
-		APIKey:     ws.credentials.apiKey,
+		JWT:        ws.buildJWT(),
 		Timestamp:  timestamp,
-		Signature:  ws.signature(timestamp, channel, productIDs),
 	}
 
 	ws.logger.Printf("Unsubscribe from %q channel", channel)
@@ -170,14 +183,39 @@ func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
 	return ws
 }
 
-func (ws *AdvancedTradeWS) signature(timestamp, channel string, productIDs []string) string {
-	payload := fmt.Sprintf("%s%s%s", timestamp, channel, strings.Join(productIDs, ","))
+// buildJWT creates an JWT for authenticate API requests.
+func (ws *AdvancedTradeWS) buildJWT() string {
+	block, _ := pem.Decode([]byte(ws.credentials.apiSecret))
+	if block == nil {
+		panic("jwt: Could not decode private key")
+	}
 
-	sig := hmac.New(sha256.New, []byte(ws.credentials.apiSecret))
-	sig.Write([]byte(payload))
-	sum := hex.EncodeToString(sig.Sum(nil))
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		panic(fmt.Errorf("jwt: %w", err))
+	}
 
-	return sum
+	sig, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.ES256, Key: key},
+		(&jose.SignerOptions{NonceSource: nonceSource{}}).WithType("JWT").WithHeader("kid", ws.credentials.apiKey),
+	)
+	if err != nil {
+		panic(fmt.Errorf("jwt: %w", err))
+	}
+
+	cl := &jwt.Claims{
+		Subject:   ws.credentials.apiKey,
+		Issuer:    "coinbase-cloud",
+		NotBefore: jwt.NewNumericDate(time.Now()),
+		Expiry:    jwt.NewNumericDate(time.Now().Add(1 * time.Minute)),
+		Audience:  jwt.Audience{JWTServiceName},
+	}
+
+	jwtString, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+	if err != nil {
+		panic(fmt.Errorf("jwt: %w", err))
+	}
+	return jwtString
 }
 
 func (ws *AdvancedTradeWS) connect() error {

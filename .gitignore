@@ -1,6 +1,7 @@
 ### App related ignore files
 /.idea
 cmd
+*.json
 
 
 ### Go template

@@ -11,9 +11,8 @@ type SubscribeReq struct {
 	Type       string   `json:"type"`        // Type of the message
 	ProductIds []string `json:"product_ids"` // List of product ids
 	Channel    string   `json:"channel"`     // The name of the channel
-	APIKey     string   `json:"api_key"`     // APIKey generated from your account
+	JWT        string   `json:"jwt"`         // Each JWT is valid for 2 minutes
 	Timestamp  string   `json:"timestamp"`   // Current timestamp of the message as a unix integer
-	Signature  string   `json:"signature"`   // Signature of the message
 }
 
 // UnsubscribeReq Request of the unsubscribe message
@@ -21,9 +20,8 @@ type UnsubscribeReq struct {
 	Type       string   `json:"type"`        // Type of the message
 	ProductIds []string `json:"product_ids"` // List of product ids
 	Channel    string   `json:"channel"`     // The name of the channel
-	APIKey     string   `json:"api_key"`     // APIKey generated from your account
+	JWT        string   `json:"jwt"`         // Each JWT is valid for 2 minutes
 	Timestamp  string   `json:"timestamp"`   // Current timestamp of the message as a unix integer
-	Signature  string   `json:"signature"`   // Signature of the message
 }
 
 // Message a Websocket message
