@@ -17,8 +17,8 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 	"os"
+	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -26,14 +26,16 @@ import (
 const (
 	AdvanceTradeWebsocketURL = "wss://advanced-trade-ws.coinbase.com"
 
-	HeartbeatChannel     = "heartbeats"
-	Level2Channel        = "level2"
-	MarketTradesChannel  = "market_trades"
-	StatusChannel        = "status"
+	HeartbeatChannel    = "heartbeats"    // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#heartbeats-channel
+	CandlesChannel      = "candles"       // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#candles-channel
+	MarketTradesChannel = "market_trades" // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#market-trades-channel
+	StatusChannel       = "status"        // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#status-channel
+	TickerChannel       = "ticker"        // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#ticker-channel
+	TickerBatchChannel  = "ticker_batch"  // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#ticker-batch-channel
+	Level2Channel       = "level2"        // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#level2-channel
+	UserChannel         = "user"          // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#user-channel
+
 	SubscriptionsChannel = "subscriptions"
-	TickerBatchChannel   = "ticker_batch"
-	TickerChannel        = "ticker"
-	UserChannel          = "user"
 
 	ContextTimeout = time.Second * 10
 	JWTServiceName = "public_websocket_api"
@@ -51,7 +53,7 @@ func (n nonceSource) Nonce() (string, error) {
 
 type Option func(*AdvancedTradeWS)
 
-// WithCredentials option provides the required apiKey and apiSecret of the coinbase user
+// WithCredentials option provides the required apiKey and apiSecret of the coinbase user.
 func WithCredentials(apiKey, apiSecret string) Option {
 	return func(ws *AdvancedTradeWS) {
 		ws.credentials.apiKey = apiKey
@@ -66,10 +68,23 @@ func WithURL(url string) Option {
 	}
 }
 
+// WithSubscriptions sets a combination of channel and productIDs the user wants to subscribe to.
+func WithSubscriptions(s map[string][]string) Option {
+	for channel := range s {
+		if !isAllowedChannel(channel) {
+			panic(fmt.Sprintf("unkown channel %q", channel))
+		}
+	}
+
+	return func(ws *AdvancedTradeWS) {
+		ws.subscriptions = s
+	}
+}
+
 // WithLogging option enables package logging to stdErr (Default: logging to io.Discard)
 func WithLogging() Option {
 	return func(ws *AdvancedTradeWS) {
-		ws.logger = log.New(os.Stderr, "", log.Lmicroseconds)
+		ws.logger = log.New(os.Stderr, "", log.Lmicroseconds|log.Lshortfile)
 	}
 }
 
@@ -83,22 +98,25 @@ type AdvancedTradeWS struct {
 		apiKey    string
 		apiSecret string
 	}
-	Channel struct {
+	subscriptions map[string][]string // A map of channel to productIDs
+	lastMsg       interface{}         // Last send message
+	Channel       struct {
 		Heartbeat    <-chan HeartbeatMessage
-		Level2       <-chan Level2Message
-		MarketTrades <-chan MarketTradesMessage
+		Candles      <-chan CandlesMessage
 		Status       <-chan StatusMessage
-		Subscription <-chan SubscriptionsMessage
+		MarketTrades <-chan MarketTradesMessage
 		Ticker       <-chan TickerMessage
+		Level2       <-chan Level2Message
 		User         <-chan UserMessage
 	}
 }
 
 func New(opts ...Option) *AdvancedTradeWS {
 	ws := &AdvancedTradeWS{
-		logger: log.New(io.Discard, "", log.LstdFlags),
-		opts:   opts,
-		wsURL:  AdvanceTradeWebsocketURL,
+		logger:        log.New(io.Discard, "", log.LstdFlags),
+		opts:          opts,
+		wsURL:         AdvanceTradeWebsocketURL,
+		subscriptions: make(map[string][]string),
 	}
 
 	// Loop through each option
@@ -117,8 +135,24 @@ func (ws *AdvancedTradeWS) CloseNormal() {
 }
 
 func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
-	defer cancel()
+	if err := ws.subscribe(channel, productIDs); err != nil {
+		ws.logger.Print(err)
+		return
+	}
+}
+
+func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
+	if err := ws.unsubscribe(channel, productIDs); err != nil {
+		ws.logger.Print(err)
+		return
+	}
+}
+
+func (ws *AdvancedTradeWS) subscribe(channel string, productIDs []string) error {
+	if !isAllowedChannel(channel) {
+		return fmt.Errorf("subscribe error: unsupported channel %q", channel)
+	}
+
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
 
 	msg := SubscribeReq{
@@ -129,22 +163,16 @@ func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
 		Timestamp:  timestamp,
 	}
 
-	if len(productIDs) > 0 {
-		ws.logger.Printf("Subscribe to %q channel for product ids: [%s]", channel, strings.Join(productIDs, ","))
-	} else {
-		ws.logger.Printf("Subscribe to %q channel", channel)
-	}
+	ws.logger.Printf("subscribe to channel %s", msg.Channel)
 
-	err := wsjson.Write(ctx, ws.conn, msg)
-	if err != nil {
-		// ...
-		panic(err)
-	}
+	return ws.writeJsonMessage(msg)
 }
 
-func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
-	defer cancel()
+func (ws *AdvancedTradeWS) unsubscribe(channel string, productIDs []string) error {
+	if _, ok := ws.subscriptions[channel]; !ok {
+		return fmt.Errorf("unsubscribe error: unsupported or not subscribed channel %q", channel)
+	}
+
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
 
 	msg := UnsubscribeReq{
@@ -155,13 +183,9 @@ func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 		Timestamp:  timestamp,
 	}
 
-	ws.logger.Printf("Unsubscribe from %q channel", channel)
+	ws.logger.Printf("unsubscribe from channel %s", msg.Channel)
 
-	err := wsjson.Write(ctx, ws.conn, msg)
-	if err != nil {
-		// ...
-		panic(err)
-	}
+	return ws.writeJsonMessage(msg)
 }
 
 func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
@@ -172,13 +196,22 @@ func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
 
 	if err != nil {
 		// Max reconnection tries reached -> exit
-		panic(err)
+		ws.logger.Printf("max ammount of reconnection tries reached -> exit application")
+		os.Exit(1)
+	}
+
+	go ws.readMessages()
+	time.Sleep(time.Millisecond * 250)
+
+	// Subscribe to channels
+	for channel, productIDs := range ws.subscriptions {
+		ws.Subscribe(channel, productIDs)
 	}
 
 	// We always subscribe to the heartbeat channel, in order to keep the connection open
-	ws.Subscribe(HeartbeatChannel, nil)
-
-	go ws.readMessages()
+	if _, ok := ws.subscriptions[HeartbeatChannel]; !ok {
+		ws.Subscribe(HeartbeatChannel, nil)
+	}
 
 	return ws
 }
@@ -279,10 +312,10 @@ func (ws *AdvancedTradeWS) readMessages() {
 		return ch
 	}(marketTradesChan)
 
-	subscriptionChan := make(chan SubscriptionsMessage, 10)
-	ws.Channel.Subscription = func(ch chan SubscriptionsMessage) <-chan SubscriptionsMessage {
+	candlesChan := make(chan CandlesMessage, 50)
+	ws.Channel.Candles = func(ch chan CandlesMessage) <-chan CandlesMessage {
 		return ch
-	}(subscriptionChan)
+	}(candlesChan)
 
 	for {
 		if err := wsjson.Read(context.Background(), ws.conn, &res); err != nil {
@@ -311,6 +344,11 @@ func (ws *AdvancedTradeWS) readMessages() {
 			_ = json.Unmarshal(data, &m)
 			discardOldest(heartbeatChan)
 			heartbeatChan <- m
+		case CandlesChannel:
+			var m CandlesMessage
+			_ = json.Unmarshal(data, &m)
+			discardOldest(candlesChan)
+			candlesChan <- m
 		case UserChannel:
 			var m UserMessage
 			_ = json.Unmarshal(data, &m)
@@ -321,11 +359,6 @@ func (ws *AdvancedTradeWS) readMessages() {
 			_ = json.Unmarshal(data, &m)
 			discardOldest(statusChan)
 			statusChan <- m
-		case SubscriptionsChannel:
-			var m SubscriptionsMessage
-			_ = json.Unmarshal(data, &m)
-			discardOldest(subscriptionChan)
-			subscriptionChan <- m
 		case TickerChannel, TickerBatchChannel:
 			var m TickerMessage
 			_ = json.Unmarshal(data, &m)
@@ -341,8 +374,23 @@ func (ws *AdvancedTradeWS) readMessages() {
 			_ = json.Unmarshal(data, &m)
 			discardOldest(marketTradesChan)
 			marketTradesChan <- m
+		case SubscriptionsChannel:
+			var m SubscriptionsMessage
+			_ = json.Unmarshal(data, &m)
+			ws.logger.Printf("SubscriptionsMessage: %v", m)
+		case "":
+			var m struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			}
+			_ = json.Unmarshal(data, &m)
+			if m.Type == "error" {
+				ws.logger.Printf("message error: %s\nlast send message: %v", m.Message, ws.lastMsg)
+				return
+			}
+			ws.logger.Print(data)
 		default:
-			ws.logger.Print("Unknown message:", string(data))
+			ws.logger.Printf("unknown channel %q with message: %s", msg.Channel, data)
 		}
 	}
 }
@@ -352,4 +400,17 @@ func discardOldest[T any](c chan T) {
 	if len(c) == cap(c) {
 		<-c // Discard oldest message
 	}
+}
+
+func isAllowedChannel(channel string) bool {
+	var allowedChannels = []string{HeartbeatChannel, CandlesChannel, MarketTradesChannel, StatusChannel, TickerChannel, TickerBatchChannel, Level2Channel, UserChannel}
+	return slices.Contains(allowedChannels, channel)
+}
+
+func (ws *AdvancedTradeWS) writeJsonMessage(msg interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
+	defer cancel()
+
+	ws.lastMsg = msg
+	return wsjson.Write(ctx, ws.conn, msg)
 }
