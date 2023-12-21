@@ -39,9 +39,12 @@ func main() {
 	ws := catws.New(
 		catws.WithCredentials("YOUR_COINBASE_API_KEY", "YOUR_COINBASE_API_SECRET"),
 		catws.WithLogging(), // Enable logging.
+		catws.WithSubscriptions(map[string][]string{ // Set default subscriptions -> will be also established after reconnect.
+			catws.UserChannel:    nil,
+			catws.CandlesChannel: {"BTC-EUR"},
+		}),
+		
 	)
-	// Subscribe to user channel (no product_ids needed)
-	ws.Subscribe(catws.UserChannel, nil)
 	// Subscribe to Ticker batch updates for some product ids
 	ws.Subscribe(catws.TickerBatchChannel, []string{"BTC-EUR", "ETH-EUR", "XRP-EUR"})
 	quitChan := make(chan struct{})
@@ -51,8 +54,6 @@ func main() {
 			select {
 			//case m := <-ws.Channel.Heartbeat:
 			//	fmt.Println(m)
-			case m := <-ws.Channel.Subscription:
-				fmt.Println(m)
 			case m := <-ws.Channel.User:
 				fmt.Println(m)
 			case m := <-ws.Channel.Ticker:

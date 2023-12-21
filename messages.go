@@ -36,7 +36,24 @@ type Message struct {
 type SubscriptionsMessage struct {
 	Message
 	Events []struct {
-		Subscriptions map[string][]interface{} `json:"subscriptions"`
+		Subscriptions map[string][]string `json:"subscriptions"`
+	} `json:"events"`
+}
+
+// CandlesMessage Response of the subscribe message
+type CandlesMessage struct {
+	Message
+	Events []struct {
+		Type    string `json:"type"`
+		Candles []struct {
+			Start     string `json:"start"`
+			High      string `json:"high"`
+			Low       string `json:"low"`
+			Open      string `json:"open"`
+			Close     string `json:"close"`
+			Volume    string `json:"volume"`
+			ProductID string `json:"product_id"`
+		} `json:"candles"`
 	} `json:"events"`
 }
 
