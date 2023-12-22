@@ -43,11 +43,11 @@ func main() {
 			catws.UserChannel:    nil,
 			catws.CandlesChannel: {"BTC-EUR"},
 		}),
-		
+		catws.WithMaxElapsedTime(time.Hour), // Retry reconnect with exponential backoff for at most 1hour before exiting the app.
 	)
 	// Subscribe to Ticker batch updates for some product ids
-	ws.Subscribe(catws.TickerBatchChannel, []string{"BTC-EUR", "ETH-EUR", "XRP-EUR"})
-	quitChan := make(chan struct{})
+	ws.Subscribe(catws.TickerBatchChannel, []string{"BTC-EUR", "ETH-EUR", "XRP-EUR"}) // Will not be established after reconnect
+	closeChan := make(chan struct{})
 
 	go func() {
 		for {
@@ -64,9 +64,8 @@ func main() {
 				fmt.Println(m)
 			case m := <-ws.Channel.Level2:
 				fmt.Println(m)
-			case <-quitChan:
+			case <-closeChan:
 				fmt.Println("shutdown go-routine...")
-				quitChan <- struct{}{}
 				return
 			}
 		}
@@ -74,12 +73,7 @@ func main() {
 
 	// Block until a signal is received. (CTRL-C)
 	<-c
-	// Correctly unsubscribe from user channel, since only one connection per user is allowed.
-	ws.Unsubscribe(catws.UserChannel, nil)
-	time.Sleep(time.Second)
-	quitChan <- struct{}{}
-	// Wait for the go routine to quit.
-	<-quitChan
+	closeChan <- struct{}{}
 	fmt.Println("closing websocket...")
 	ws.CloseNormal()
 }

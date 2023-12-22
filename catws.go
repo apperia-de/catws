@@ -35,10 +35,13 @@ const (
 	Level2Channel       = "level2"        // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#level2-channel
 	UserChannel         = "user"          // https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-channels#user-channel
 
+	emptyChannel = "" // Channel might be empty if an error occurs
+
 	SubscriptionsChannel = "subscriptions"
 
-	ContextTimeout = time.Second * 10
-	JWTServiceName = "public_websocket_api"
+	ContextTimeout     = 5 * time.Second
+	ContextReadTimeout = 10 * time.Second
+	JWTServiceName     = "public_websocket_api"
 )
 
 type nonceSource struct{}
@@ -88,9 +91,18 @@ func WithLogging() Option {
 	}
 }
 
+// WithMaxElapsedTime sets the MaxElapsedTime after which the exponential backoff
+// retries will finally stop trying to reconnect. Defaults to 15 minutes.
+// Set to 0 in order to deactivate and let it retry forever.
+func WithMaxElapsedTime(maxElapsedTime time.Duration) Option {
+	return func(ws *AdvancedTradeWS) {
+		ws.maxElapsedTime = maxElapsedTime
+	}
+}
+
 type AdvancedTradeWS struct {
 	conn        *websocket.Conn
-	wg          sync.WaitGroup
+	mu          sync.Mutex
 	logger      *log.Logger
 	opts        []Option // Store options for reconnect
 	wsURL       string
@@ -98,9 +110,12 @@ type AdvancedTradeWS struct {
 		apiKey    string
 		apiSecret string
 	}
-	subscriptions map[string][]string // A map of channel to productIDs
-	lastMsg       interface{}         // Last send message
-	Channel       struct {
+	subscriptions  map[string][]string // A map of channel to productIDs
+	maxElapsedTime time.Duration       // Max reconnect time elapsed before the application stops
+	active         bool
+	ctx            context.Context
+	cancelFunc     context.CancelFunc
+	Channel        struct {
 		Heartbeat    <-chan HeartbeatMessage
 		Candles      <-chan CandlesMessage
 		Status       <-chan StatusMessage
@@ -109,48 +124,125 @@ type AdvancedTradeWS struct {
 		Level2       <-chan Level2Message
 		User         <-chan UserMessage
 	}
+	channel struct {
+		heartbeat    chan HeartbeatMessage
+		candles      chan CandlesMessage
+		status       chan StatusMessage
+		marketTrades chan MarketTradesMessage
+		ticker       chan TickerMessage
+		level2       chan Level2Message
+		user         chan UserMessage
+	}
 }
 
 func New(opts ...Option) *AdvancedTradeWS {
 	ws := &AdvancedTradeWS{
-		logger:        log.New(io.Discard, "", log.LstdFlags),
-		opts:          opts,
-		wsURL:         AdvanceTradeWebsocketURL,
-		subscriptions: make(map[string][]string),
+		logger:         log.New(io.Discard, "", log.LstdFlags),
+		opts:           opts,
+		active:         true,
+		wsURL:          AdvanceTradeWebsocketURL,
+		subscriptions:  make(map[string][]string),
+		maxElapsedTime: 15 * time.Minute, // Default time before not trying to reconnect anymore.
 	}
+
+	// Initialize available channels
+	ws.channel.heartbeat = make(chan HeartbeatMessage, 1)
+	ws.Channel.Heartbeat = ws.channel.heartbeat
+
+	ws.channel.status = make(chan StatusMessage, 5)
+	ws.Channel.Status = ws.channel.status
+
+	ws.channel.user = make(chan UserMessage, 5)
+	ws.Channel.User = ws.channel.user
+
+	ws.channel.ticker = make(chan TickerMessage, 50)
+	ws.Channel.Ticker = ws.channel.ticker
+
+	ws.channel.ticker = make(chan TickerMessage, 50)
+	ws.Channel.Ticker = ws.channel.ticker
+
+	ws.channel.level2 = make(chan Level2Message, 100)
+	ws.Channel.Level2 = ws.channel.level2
+
+	ws.channel.marketTrades = make(chan MarketTradesMessage, 50)
+	ws.Channel.MarketTrades = ws.channel.marketTrades
+
+	ws.channel.candles = make(chan CandlesMessage, 50)
+	ws.Channel.Candles = ws.channel.candles
 
 	// Loop through each option
 	for _, opt := range opts {
 		opt(ws)
 	}
 
-	return connect(ws)
+	return ws
 }
 
-func (ws *AdvancedTradeWS) CloseNormal() {
-	if err := ws.conn.Close(websocket.StatusNormalClosure, ""); err != nil {
-		ws.logger.Fatal(err)
+func (ws *AdvancedTradeWS) Connect() error {
+	bOff := backoff.NewExponentialBackOff()
+	bOff.MaxElapsedTime = ws.maxElapsedTime
+	// bOffWithRetries := backoff.WithMaxRetries(bOff, 5)
+
+	err := backoff.RetryNotify(ws.connect, bOff, func(err error, t time.Duration) {
+		ws.logger.Print(err)
+		ws.logger.Printf("Next reconnection try at %s", time.Now().Add(t))
+	})
+
+	return err
+}
+
+func (ws *AdvancedTradeWS) connect() error {
+	var err error
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.ctx, ws.cancelFunc = context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(ws.ctx, ContextTimeout)
+	defer cancel()
+
+	ws.conn, _, err = websocket.Dial(ctx, ws.wsURL, nil)
+	if err != nil {
+		return err
 	}
-	ws.wg.Wait()
+
+	// In order to disable read limit set it to -1
+	ws.conn.SetReadLimit(1 << 20) // Equals 2^20 = 1048576 bytes = 1MB
+
+	go func() {
+		<-ws.ctx.Done()
+		// Reconnect on error
+		go ws.reConnect()
+	}()
+
+	go ws.readMessages()
+
+	// Subscribe to channels
+	for channel, productIDs := range ws.subscriptions {
+		ws.Subscribe(channel, productIDs)
+	}
+
+	// We always subscribe to the heartbeat channel, in order to keep the connection open
+	if _, ok := ws.subscriptions[HeartbeatChannel]; !ok {
+		ws.Subscribe(HeartbeatChannel, nil)
+	}
+
+	return nil
+}
+
+func (ws *AdvancedTradeWS) CloseNormal() error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if ws.conn == nil {
+		// Ignore, since the connection has not been established yet
+		return nil
+	}
+	return ws.conn.Close(websocket.StatusNormalClosure, "")
 }
 
 func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
-	if err := ws.subscribe(channel, productIDs); err != nil {
-		ws.logger.Print(err)
-		return
-	}
-}
-
-func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
-	if err := ws.unsubscribe(channel, productIDs); err != nil {
-		ws.logger.Print(err)
-		return
-	}
-}
-
-func (ws *AdvancedTradeWS) subscribe(channel string, productIDs []string) error {
 	if !isAllowedChannel(channel) {
-		return fmt.Errorf("subscribe error: unsupported channel %q", channel)
+		panic(fmt.Sprintf("subscribe error: unsupported channel %q", channel))
 	}
 
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
@@ -163,14 +255,13 @@ func (ws *AdvancedTradeWS) subscribe(channel string, productIDs []string) error 
 		Timestamp:  timestamp,
 	}
 
+	ws.writeJsonMessage(msg)
 	ws.logger.Printf("subscribe to channel %s", msg.Channel)
-
-	return ws.writeJsonMessage(msg)
 }
 
-func (ws *AdvancedTradeWS) unsubscribe(channel string, productIDs []string) error {
+func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
 	if _, ok := ws.subscriptions[channel]; !ok {
-		return fmt.Errorf("unsubscribe error: unsupported or not subscribed channel %q", channel)
+		panic(fmt.Sprintf("unsubscribe error: unsupported or not subscribed channel %q", channel))
 	}
 
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
@@ -183,37 +274,8 @@ func (ws *AdvancedTradeWS) unsubscribe(channel string, productIDs []string) erro
 		Timestamp:  timestamp,
 	}
 
+	ws.writeJsonMessage(msg)
 	ws.logger.Printf("unsubscribe from channel %s", msg.Channel)
-
-	return ws.writeJsonMessage(msg)
-}
-
-func connect(ws *AdvancedTradeWS) *AdvancedTradeWS {
-	err := backoff.RetryNotify(ws.connect, backoff.NewExponentialBackOff(), func(err error, t time.Duration) {
-		ws.logger.Print(err)
-		ws.logger.Printf("Next reconnection try at %s", time.Now().Add(t))
-	})
-
-	if err != nil {
-		// Max reconnection tries reached -> exit
-		ws.logger.Printf("max ammount of reconnection tries reached -> exit application")
-		os.Exit(1)
-	}
-
-	go ws.readMessages()
-	time.Sleep(time.Millisecond * 250)
-
-	// Subscribe to channels
-	for channel, productIDs := range ws.subscriptions {
-		ws.Subscribe(channel, productIDs)
-	}
-
-	// We always subscribe to the heartbeat channel, in order to keep the connection open
-	if _, ok := ws.subscriptions[HeartbeatChannel]; !ok {
-		ws.Subscribe(HeartbeatChannel, nil)
-	}
-
-	return ws
 }
 
 // buildJWT creates an JWT for authenticate API requests.
@@ -251,86 +313,35 @@ func (ws *AdvancedTradeWS) buildJWT() string {
 	return jwtString
 }
 
-func (ws *AdvancedTradeWS) connect() error {
-	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
-	defer cancel()
-
-	c, _, err := websocket.Dial(ctx, ws.wsURL, nil)
-	if err != nil {
-		return err
-	}
-
-	// In order to disable read limit set it to -1
-	c.SetReadLimit(1 << 20) // Equals 2^20 = 1048576 bytes = 1MB
-
-	ws.conn = c
-
-	return nil
-}
-
-func (ws *AdvancedTradeWS) reconnect() {
-	_ = ws.conn.CloseNow()
-	ws.wg.Wait()
-	ws.logger.Printf("Reconnecting...")
-	*ws = *New(ws.opts...)
-}
-
 // readMessages reads message from the subscribed websocket channels and sends it to the corresponding messageChan
 func (ws *AdvancedTradeWS) readMessages() {
-	var res interface{}
-
-	ws.wg.Add(1)
-	defer ws.wg.Done()
-
-	heartbeatChan := make(chan HeartbeatMessage, 1)
-	ws.Channel.Heartbeat = func(ch chan HeartbeatMessage) <-chan HeartbeatMessage {
-		return ch
-	}(heartbeatChan)
-
-	statusChan := make(chan StatusMessage, 5)
-	ws.Channel.Status = func(ch chan StatusMessage) <-chan StatusMessage {
-		return ch
-	}(statusChan)
-
-	userChan := make(chan UserMessage, 5)
-	ws.Channel.User = func(ch chan UserMessage) <-chan UserMessage {
-		return ch
-	}(userChan)
-
-	tickerChan := make(chan TickerMessage, 50)
-	ws.Channel.Ticker = func(ch chan TickerMessage) <-chan TickerMessage {
-		return ch
-	}(tickerChan)
-
-	level2Chan := make(chan Level2Message, 100)
-	ws.Channel.Level2 = func(ch chan Level2Message) <-chan Level2Message {
-		return ch
-	}(level2Chan)
-
-	marketTradesChan := make(chan MarketTradesMessage, 50)
-	ws.Channel.MarketTrades = func(ch chan MarketTradesMessage) <-chan MarketTradesMessage {
-		return ch
-	}(marketTradesChan)
-
-	candlesChan := make(chan CandlesMessage, 50)
-	ws.Channel.Candles = func(ch chan CandlesMessage) <-chan CandlesMessage {
-		return ch
-	}(candlesChan)
+	var (
+		res    interface{}
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	defer func() { ws.logger.Print("Exiting readMessages go routine") }()
 
 	for {
-		if err := wsjson.Read(context.Background(), ws.conn, &res); err != nil {
+		ctx, cancel = context.WithTimeout(ws.ctx, ContextReadTimeout)
+
+		if err := wsjson.Read(ctx, ws.conn, &res); err != nil {
 			switch websocket.CloseStatus(err) {
 			case websocket.StatusNormalClosure:
 				ws.logger.Print("Received normal close message")
 			case websocket.StatusAbnormalClosure:
 				ws.logger.Print("Abnormal closure -> Restart websocket")
-				go ws.reconnect()
+				ws.cancelFunc()
 			case -1:
 				// Not a CloseError
 				ws.logger.Printf("Not a CloseError: %s\n", err)
-				go ws.reconnect()
+				ws.cancelFunc()
+			default:
+				ws.logger.Printf("CloseStatus: %s - Error: %s\n", websocket.CloseStatus(err), err)
+				ws.cancelFunc()
 			}
 
+			cancel()
 			return
 		}
 
@@ -342,50 +353,53 @@ func (ws *AdvancedTradeWS) readMessages() {
 		case HeartbeatChannel:
 			var m HeartbeatMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(heartbeatChan)
-			heartbeatChan <- m
+			discardOldest(ws.channel.heartbeat)
+			ws.channel.heartbeat <- m
 		case CandlesChannel:
 			var m CandlesMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(candlesChan)
-			candlesChan <- m
+			discardOldest(ws.channel.candles)
+			ws.channel.candles <- m
 		case UserChannel:
 			var m UserMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(userChan)
-			userChan <- m
+			discardOldest(ws.channel.user)
+			ws.channel.user <- m
 		case StatusChannel:
 			var m StatusMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(statusChan)
-			statusChan <- m
+			discardOldest(ws.channel.status)
+			ws.channel.status <- m
 		case TickerChannel, TickerBatchChannel:
 			var m TickerMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(tickerChan)
-			tickerChan <- m
+			discardOldest(ws.channel.ticker)
+			ws.channel.ticker <- m
 		case Level2Channel:
 			var m Level2Message
 			_ = json.Unmarshal(data, &m)
-			discardOldest(level2Chan)
-			level2Chan <- m
+			discardOldest(ws.channel.level2)
+			ws.channel.level2 <- m
 		case MarketTradesChannel:
 			var m MarketTradesMessage
 			_ = json.Unmarshal(data, &m)
-			discardOldest(marketTradesChan)
-			marketTradesChan <- m
+			discardOldest(ws.channel.marketTrades)
+			ws.channel.marketTrades <- m
 		case SubscriptionsChannel:
 			var m SubscriptionsMessage
 			_ = json.Unmarshal(data, &m)
 			ws.logger.Printf("SubscriptionsMessage: %v", m)
-		case "":
+		case emptyChannel:
 			var m struct {
 				Message string `json:"message"`
 				Type    string `json:"type"`
 			}
 			_ = json.Unmarshal(data, &m)
 			if m.Type == "error" {
-				ws.logger.Printf("message error: %s\nlast send message: %v", m.Message, ws.lastMsg)
+				ws.logger.Printf("message error: %s", m.Message)
+				ws.cancelFunc()
+
+				cancel()
 				return
 			}
 			ws.logger.Print(data)
@@ -407,10 +421,23 @@ func isAllowedChannel(channel string) bool {
 	return slices.Contains(allowedChannels, channel)
 }
 
-func (ws *AdvancedTradeWS) writeJsonMessage(msg interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), ContextTimeout)
+func (ws *AdvancedTradeWS) writeJsonMessage(msg interface{}) {
+	if ws.conn == nil {
+		ws.logger.Print("cannot write a message before connecting")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ws.ctx, ContextTimeout)
 	defer cancel()
 
-	ws.lastMsg = msg
-	return wsjson.Write(ctx, ws.conn, msg)
+	if err := wsjson.Write(ctx, ws.conn, msg); err != nil {
+		ws.logger.Print(err)
+		ws.cancelFunc()
+	}
+}
+
+func (ws *AdvancedTradeWS) reConnect() {
+	if err := ws.Connect(); err != nil {
+		panic("max reconnect tries reached")
+	}
 }
