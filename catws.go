@@ -2,18 +2,12 @@ package catws
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"github.com/cenkalti/backoff/v4"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	"io"
 	"log"
-	"math"
-	"math/big"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 	"os"
@@ -41,18 +35,10 @@ const (
 
 	ContextTimeout     = 5 * time.Second
 	ContextReadTimeout = 10 * time.Second
-	JWTServiceName     = "public_websocket_api"
+
+	JWTAudience = "public_websocket_api"
+	JWTIssuer   = "coinbase-cloud"
 )
-
-type nonceSource struct{}
-
-func (n nonceSource) Nonce() (string, error) {
-	r, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
-	if err != nil {
-		return "", err
-	}
-	return r.String(), nil
-}
 
 type Option func(*AdvancedTradeWS)
 
@@ -191,6 +177,83 @@ func (ws *AdvancedTradeWS) Connect() error {
 	return err
 }
 
+func (ws *AdvancedTradeWS) CloseNormal() error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if ws.conn == nil {
+		// Ignore, since the connection has not been established yet
+		return nil
+	}
+	return ws.conn.Close(websocket.StatusNormalClosure, "")
+}
+
+func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
+	if !isAllowedChannel(channel) {
+		panic(fmt.Sprintf("subscribe error: unsupported channel %q", channel))
+	}
+
+	msg := SubscribeReq{
+		Type:       "subscribe",
+		ProductIds: productIDs,
+		Channel:    channel,
+		JWT:        ws.buildJWT(),
+		Timestamp:  getUnixTimestamp(),
+	}
+
+	ws.writeJsonMessage(msg)
+	ws.logger.Printf("subscribe to channel %s", msg.Channel)
+}
+
+func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
+	if _, ok := ws.subscriptions[channel]; !ok {
+		panic(fmt.Sprintf("unsubscribe error: unsupported or not subscribed channel %q", channel))
+	}
+
+	msg := UnsubscribeReq{
+		Type:       "unsubscribe",
+		ProductIds: productIDs,
+		Channel:    channel,
+		JWT:        ws.buildJWT(),
+		Timestamp:  getUnixTimestamp(),
+	}
+
+	ws.writeJsonMessage(msg)
+	ws.logger.Printf("unsubscribe from channel %s", msg.Channel)
+}
+
+// buildJWT creates an JWT for authenticate API requests.
+func (ws *AdvancedTradeWS) buildJWT() string {
+	token := &jwt.Token{
+		Header: map[string]interface{}{
+			"typ":   "JWT",
+			"alg":   jwt.SigningMethodES256.Alg(),
+			"kid":   ws.credentials.apiKey,
+			"nonce": getUnixTimestamp(),
+		},
+		Claims: jwt.MapClaims{
+			"sub": ws.credentials.apiKey,
+			"iss": JWTIssuer,
+			"nbf": jwt.NewNumericDate(time.Now()),
+			"exp": jwt.NewNumericDate(time.Now().Add(1 * time.Minute)),
+			"aud": JWTAudience,
+		},
+		Method: jwt.SigningMethodES256,
+	}
+
+	key, err := jwt.ParseECPrivateKeyFromPEM([]byte(ws.credentials.apiSecret))
+	if err != nil {
+		panic(fmt.Errorf("jwt: %w", err))
+	}
+
+	jwtString, err := token.SignedString(key)
+	if err != nil {
+		panic(fmt.Errorf("jwt: %w", err))
+	}
+
+	return jwtString
+}
+
 func (ws *AdvancedTradeWS) connect() error {
 	var err error
 	ws.mu.Lock()
@@ -227,90 +290,6 @@ func (ws *AdvancedTradeWS) connect() error {
 	}
 
 	return nil
-}
-
-func (ws *AdvancedTradeWS) CloseNormal() error {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	if ws.conn == nil {
-		// Ignore, since the connection has not been established yet
-		return nil
-	}
-	return ws.conn.Close(websocket.StatusNormalClosure, "")
-}
-
-func (ws *AdvancedTradeWS) Subscribe(channel string, productIDs []string) {
-	if !isAllowedChannel(channel) {
-		panic(fmt.Sprintf("subscribe error: unsupported channel %q", channel))
-	}
-
-	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
-
-	msg := SubscribeReq{
-		Type:       "subscribe",
-		ProductIds: productIDs,
-		Channel:    channel,
-		JWT:        ws.buildJWT(),
-		Timestamp:  timestamp,
-	}
-
-	ws.writeJsonMessage(msg)
-	ws.logger.Printf("subscribe to channel %s", msg.Channel)
-}
-
-func (ws *AdvancedTradeWS) Unsubscribe(channel string, productIDs []string) {
-	if _, ok := ws.subscriptions[channel]; !ok {
-		panic(fmt.Sprintf("unsubscribe error: unsupported or not subscribed channel %q", channel))
-	}
-
-	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
-
-	msg := UnsubscribeReq{
-		Type:       "unsubscribe",
-		ProductIds: productIDs,
-		Channel:    channel,
-		JWT:        ws.buildJWT(),
-		Timestamp:  timestamp,
-	}
-
-	ws.writeJsonMessage(msg)
-	ws.logger.Printf("unsubscribe from channel %s", msg.Channel)
-}
-
-// buildJWT creates an JWT for authenticate API requests.
-func (ws *AdvancedTradeWS) buildJWT() string {
-	block, _ := pem.Decode([]byte(ws.credentials.apiSecret))
-	if block == nil {
-		panic("jwt: Could not decode private key")
-	}
-
-	key, err := x509.ParseECPrivateKey(block.Bytes)
-	if err != nil {
-		panic(fmt.Errorf("jwt: %w", err))
-	}
-
-	sig, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.ES256, Key: key},
-		(&jose.SignerOptions{NonceSource: nonceSource{}}).WithType("JWT").WithHeader("kid", ws.credentials.apiKey),
-	)
-	if err != nil {
-		panic(fmt.Errorf("jwt: %w", err))
-	}
-
-	cl := &jwt.Claims{
-		Subject:   ws.credentials.apiKey,
-		Issuer:    "coinbase-cloud",
-		NotBefore: jwt.NewNumericDate(time.Now()),
-		Expiry:    jwt.NewNumericDate(time.Now().Add(1 * time.Minute)),
-		Audience:  jwt.Audience{JWTServiceName},
-	}
-
-	jwtString, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
-	if err != nil {
-		panic(fmt.Errorf("jwt: %w", err))
-	}
-	return jwtString
 }
 
 // readMessages reads message from the subscribed websocket channels and sends it to the corresponding messageChan
@@ -409,16 +388,10 @@ func (ws *AdvancedTradeWS) readMessages() {
 	}
 }
 
-// discardOldest removes the oldest message from the channel if the capacity of the channel is reached
-func discardOldest[T any](c chan T) {
-	if len(c) == cap(c) {
-		<-c // Discard oldest message
+func (ws *AdvancedTradeWS) reConnect() {
+	if err := ws.Connect(); err != nil {
+		panic("max reconnect tries reached")
 	}
-}
-
-func isAllowedChannel(channel string) bool {
-	var allowedChannels = []string{HeartbeatChannel, CandlesChannel, MarketTradesChannel, StatusChannel, TickerChannel, TickerBatchChannel, Level2Channel, UserChannel}
-	return slices.Contains(allowedChannels, channel)
 }
 
 func (ws *AdvancedTradeWS) writeJsonMessage(msg interface{}) {
@@ -436,8 +409,19 @@ func (ws *AdvancedTradeWS) writeJsonMessage(msg interface{}) {
 	}
 }
 
-func (ws *AdvancedTradeWS) reConnect() {
-	if err := ws.Connect(); err != nil {
-		panic("max reconnect tries reached")
+// discardOldest removes the oldest message from the channel if the capacity of the channel is reached
+func discardOldest[T any](c chan T) {
+	if len(c) == cap(c) {
+		<-c // Discard oldest message
 	}
+}
+
+func getUnixTimestamp() string {
+	return strconv.FormatInt(time.Now().UTC().Unix(), 10)
+}
+
+// isAllowedChannel returns true if the given channel is one of the allowed channels
+func isAllowedChannel(channel string) bool {
+	var allowedChannels = []string{HeartbeatChannel, CandlesChannel, MarketTradesChannel, StatusChannel, TickerChannel, TickerBatchChannel, Level2Channel, UserChannel}
+	return slices.Contains(allowedChannels, channel)
 }
