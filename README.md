@@ -4,14 +4,14 @@
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/sknr/catws?style=flat)
 ![GitHub Licence](https://img.shields.io/github/license/sknr/catws)
 
-This go package provides an easy accessible API for connecting 
+This go package provides an easy accessible API for connecting
 and consuming the *Coinbase Advanced Trade WebSocket*.
 
 > See [Advanced Trade WebSocket Overview](https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-overview) for more details.
 
 ## Installation
 
-`go get -u github.com/sknr/catws`
+`go get -u github.com/apperia-de/catws`
 
 ## Preparation
 
@@ -26,7 +26,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/sknr/catws"
+	"github.com/apperia-de/catws"
 	"os"
 	"os/signal"
 	"time"
@@ -75,6 +75,8 @@ func main() {
 	<-c
 	closeChan <- struct{}{}
 	fmt.Println("closing websocket...")
-	ws.CloseNormal()
+	if err := ws.CloseNormal(); err != nil {
+		fmt.Println(err)
+	}
 }
 ```
